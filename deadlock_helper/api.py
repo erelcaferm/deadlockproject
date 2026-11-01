@@ -54,12 +54,21 @@ class DeadlockAPI:
         return int(time.time()) - LOOKBACK_DAYS * 24 * 3600
 
     # ---------- static game data ----------
+    def _assets(self, name: str, params: dict[str, Any] | None = None) -> Any:
+        """Static data from assets.deadlock-api.com, falling back to the identical
+        copy served by api.deadlock-api.com/v1/assets when the assets host is
+        unreachable (some networks and firewalls only allow one of the two)."""
+        try:
+            return self._get(ASSETS_URL, f"/v2/{name}", params, ASSETS_TTL_S)
+        except requests.RequestException:
+            return self._get(ANALYTICS_URL, f"/v1/assets/{name}", params, ASSETS_TTL_S)
+
     def heroes(self) -> list[dict]:
-        return self._get(ASSETS_URL, "/v2/heroes", {"only_active": "true"}, ASSETS_TTL_S)
+        return self._assets("heroes", {"only_active": "true"})
 
     def items(self) -> list[dict]:
         """All items, including shop upgrades (type 'upgrade') and hero abilities (type 'ability')."""
-        return self._get(ASSETS_URL, "/v2/items", None, ASSETS_TTL_S)
+        return self._assets("items")
 
     # ---------- analytics ----------
     def item_stats(self, hero_id: int, enemy_hero_ids: list[int] | None = None,
