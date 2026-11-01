@@ -14,6 +14,11 @@ from .recommender import Recommendation, recommend
 TIER_COST = {1: "800", 2: "1600", 3: "3200", 4: "6400"}
 
 
+def _mmss(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 60}:{s % 60:02d}"
+
+
 def format_recommendation(rec: Recommendation) -> str:
     lines = [f"=== {rec.hero} ===" + (f"  vs  {', '.join(rec.enemies)}" if rec.enemies else "")]
 
@@ -26,6 +31,13 @@ def format_recommendation(rec: Recommendation) -> str:
         lines.append(f"  based on {rec.ability_order_matches} games, {rec.ability_order_win_rate:.0%} win rate")
     else:
         lines.append("  (not enough data)")
+
+    if rec.ability_steps:
+        lines.append("\nAbility points, step by step")
+        for st in rec.ability_steps:
+            key = f"[{st.key}]" if st.key else "   "
+            when = f"~{_mmss(st.avg_time_s)}" if st.avg_time_s is not None else "late"
+            lines.append(f"  {st.step:>2}. {when:>6}  {key} {st.ability:<20} {st.action:<7} {st.effect}")
 
     lines.append("\nCore items by tier")
     for tier, picks in rec.core_items.items():

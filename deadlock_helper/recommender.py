@@ -46,12 +46,28 @@ class ItemPick:
 
 
 @dataclass
+class AbilityStep:
+    """One ability point spent: unlocking an ability or buying one of its 3 upgrade ranks."""
+    step: int
+    ability: str
+    key: int | None  # 1-4, the in-game ability slot
+    rank: int        # 0 = unlock, 1-3 = upgrade rank
+    effect: str = ""
+    avg_time_s: float | None = None  # when players typically took it; None if added to finish the build
+
+    @property
+    def action(self) -> str:
+        return "Unlock" if self.rank == 0 else f"Rank {self.rank}"
+
+
+@dataclass
 class Recommendation:
     hero: str
     enemies: list[str]
     core_items: dict[int, list[ItemPick]] = field(default_factory=dict)  # tier -> picks
     counter_items: list[ItemPick] = field(default_factory=list)
     ability_max_order: list[str] = field(default_factory=list)
+    ability_steps: list[AbilityStep] = field(default_factory=list)
     ability_order_win_rate: float | None = None
     ability_order_matches: int = 0
     playstyle: list[str] = field(default_factory=list)
@@ -134,6 +150,72 @@ def max_order_from_sequence(sequence: list[int], points_to_max: int = 4) -> list
     return maxed + rest
 
 
+def ability_key_slots(hero: dict, item_index: dict[int, dict]) -> dict[str, int]:
+    """Map ability class_name -> in-game key (1-4) from the hero's signature slots."""
+    hero_items = hero.get("items") or {}
+    return {cls: int(slot[-1]) for slot, cls in hero_items.items()
+            if slot.startswith("signature") and slot[-1].isdigit()}
+
+
+def ability_steps(sequence: list[int], item_index: dict[int, dict], key_slots: dict[str, int] | None = None,
+                  times: list[float] | None = None, points_to_max: int = 4) -> list[AbilityStep]:
+    """Turn a raw point sequence into a step-by-step plan.
+
+    The first point in an ability unlocks it, the next three buy upgrade ranks 1-3.
+    Abilities left unfinished are completed at the end (most-invested first) so the
+    plan always covers every unlock and rank.
+    """
+    key_slots = key_slots or {}
+    times = times or []
+    counts: Counter[int] = Counter()
+    steps: list[AbilityStep] = []
+
+    def add(aid: int, t: float | None) -> None:
+        rank = counts[aid]
+        counts[aid] += 1
+        info = item_index.get(aid, {})
+        desc = info.get("description") or {}
+        effect = ""
+        if rank == 0 and isinstance(desc, dict):
+            effect = _strip_tags(str(desc.get("quip") or ""))
+        elif isinstance(desc, dict):
+            effect = _strip_tags(str(desc.get(f"t{rank}_desc") or ""))
+        if rank > 0 and not effect:
+            effect = _upgrade_from_properties(info, rank)
+        steps.append(AbilityStep(len(steps) + 1, info.get("name", str(aid)), key_slots.get(info.get("class_name", "")),
+                                 rank, effect, t))
+
+    for i, aid in enumerate(sequence):
+        if counts[aid] < points_to_max:
+            add(aid, times[i] if i < len(times) else None)
+    for aid, _ in counts.most_common():
+        while counts[aid] < points_to_max:
+            add(aid, None)
+    return steps
+
+
+def _upgrade_from_properties(info: dict, rank: int) -> str:
+    """Fallback rank text built from the raw stat changes, e.g. '+7m Invis Sprint Speed'."""
+    upgrades = info.get("upgrades") or []
+    if rank > len(upgrades):
+        return ""
+    props = info.get("properties") or {}
+    parts = []
+    for up in upgrades[rank - 1].get("property_upgrades", []):
+        if up.get("upgrade_type") == "EAddToScale":
+            continue
+        meta = props.get(up.get("name"), {}) or {}
+        label = meta.get("label") or up.get("name", "")
+        value = str(up.get("bonus", ""))
+        postfix = meta.get("postfix") or ""
+        if postfix and not value.endswith(postfix):
+            value += postfix
+        if not value.startswith(("-", "+")):
+            value = "+" + value
+        parts.append(f"{value} {label}".strip())
+    return ", ".join(parts)
+
+
 def best_ability_order(order_stats: list[dict], min_matches: int = MIN_MATCHES) -> dict | None:
     """Most reliable high-win-rate ability order (smoothed, so popular orders win ties)."""
     candidates = [r for r in order_stats if _matches(r) >= min_matches and r.get("abilities")]
@@ -182,7 +264,8 @@ def playstyle_notes(hero: dict, core: dict[int, list[ItemPick]],
 
 def _strip_tags(text: str) -> str:
     import re
-    return re.sub(r"<[^>]+>", "", text).strip()
+    text = re.sub(r"<br\s*/?>", " ", text)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", text)).strip()
 
 
 # ---------- wiring ----------
@@ -219,6 +302,8 @@ def recommend(api, hero_name: str, enemy_names: list[str], min_average_badge: in
     if order:
         rec.ability_max_order = [item_index.get(int(a), {}).get("name", str(a))
                                  for a in max_order_from_sequence([int(a) for a in order["abilities"]])]
+        rec.ability_steps = ability_steps([int(a) for a in order["abilities"]], item_index,
+                                          ability_key_slots(hero, item_index), order.get("avg_upgrade_times_s"))
         rec.ability_order_matches = _matches(order)
         rec.ability_order_win_rate = raw_win_rate(order)
 
