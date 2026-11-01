@@ -6,6 +6,7 @@ without network access. `recommend()` at the bottom wires them to the API.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -71,7 +72,8 @@ class Recommendation:
     ability_order_win_rate: float | None = None
     ability_order_matches: int = 0
     playstyle: list[str] = field(default_factory=list)
-    matchups: list[tuple[str, float, int]] = field(default_factory=list)  # (enemy, my win rate, games)
+    matchups: list["Matchup"] = field(default_factory=list)  # worst edge first
+    overall_win_rate: float | None = None  # this hero's win rate against everyone
 
 
 # ---------- items ----------
@@ -81,26 +83,37 @@ def index_items(items: list[dict]) -> dict[int, dict]:
 
 def rank_items(item_stats: list[dict], item_index: dict[int, dict], per_tier: int = 4,
                min_matches: int = MIN_MATCHES) -> dict[int, list[ItemPick]]:
-    """Best shop items per tier for a hero, ranked by smoothed win rate."""
+    """Best shop items per tier for a hero, ranked by smoothed win rate.
+
+    Each item is smoothed toward the average win rate of its own tier for this hero,
+    not toward 50%. For a hero that wins 45% of games, pulling toward 50% would lift
+    thinly played items above proven ones; for a strong hero it would bury them.
+    """
     total = sum(_matches(r) for r in item_stats) or 1
-    picks: dict[int, list[ItemPick]] = {}
+    rows: dict[int, list[tuple[dict, dict]]] = {}
     for row in item_stats:
         info = item_index.get(int(row.get("item_id", -1)))
         if not info or info.get("type") != "upgrade" or not info.get("shopable", True):
             continue
-        m = _matches(row)
-        if m < min_matches:
-            continue
-        pick = ItemPick(
-            item_id=int(info["id"]),
-            name=info.get("name", info.get("class_name", "?")),
-            tier=int(info.get("item_tier", 0)),
-            slot=str(info.get("item_slot_type", "?")),
-            cost=int(info.get("cost", 0) or 0),
-            win_rate=smoothed_win_rate(int(row.get("wins", 0)), m),
-            matches=m,
-        )
-        picks.setdefault(pick.tier, []).append(pick)
+        rows.setdefault(int(info.get("item_tier", 0)), []).append((row, info))
+
+    picks: dict[int, list[ItemPick]] = {}
+    for tier, tier_rows in rows.items():
+        tier_games = sum(_matches(r) for r, _ in tier_rows)
+        tier_wr = sum(int(r.get("wins", 0)) for r, _ in tier_rows) / tier_games if tier_games else 0.5
+        for row, info in tier_rows:
+            m = _matches(row)
+            if m < min_matches:
+                continue
+            picks.setdefault(tier, []).append(ItemPick(
+                item_id=int(info["id"]),
+                name=info.get("name", info.get("class_name", "?")),
+                tier=tier,
+                slot=str(info.get("item_slot_type", "?")),
+                cost=int(info.get("cost", 0) or 0),
+                win_rate=smoothed_win_rate(int(row.get("wins", 0)), m, prior_wr=tier_wr),
+                matches=m,
+            ))
     for tier, lst in picks.items():
         # Mostly win rate, with a small bonus for being commonly bought (proven, not niche).
         lst.sort(key=lambda p: p.win_rate + 0.02 * (p.matches / total) ** 0.5, reverse=True)
@@ -179,7 +192,7 @@ def ability_steps(sequence: list[int], item_index: dict[int, dict], key_slots: d
         if rank == 0 and isinstance(desc, dict):
             effect = _strip_tags(str(desc.get("quip") or ""))
         elif isinstance(desc, dict):
-            effect = _strip_tags(str(desc.get(f"t{rank}_desc") or ""))
+            effect = _strip_tags(str(desc.get(f"t{rank}_desc") or ""), line_break="; ")
         if rank > 0 and not effect:
             effect = _upgrade_from_properties(info, rank)
         steps.append(AbilityStep(len(steps) + 1, info.get("name", str(aid)), key_slots.get(info.get("class_name", "")),
@@ -225,17 +238,64 @@ def best_ability_order(order_stats: list[dict], min_matches: int = MIN_MATCHES) 
 
 
 # ---------- matchups & playstyle ----------
-def matchups(counter_stats: list[dict], hero_id: int, enemy_ids: list[int]) -> dict[int, tuple[float, int]]:
-    out: dict[int, tuple[float, int]] = {}
+MATCHUP_EDGE = 0.02      # 2 points better or worse than expected counts as a real matchup
+STRONG_ENEMY_WR = 0.53   # enemy heroes winning this often overall get their own warning
+
+
+@dataclass
+class Matchup:
+    enemy: str
+    win_rate: float              # my win rate in games against this enemy
+    games: int
+    expected: float | None = None  # what my win rate would be if this pairing were neutral
+    enemy_overall: float | None = None
+
+    @property
+    def edge(self) -> float:
+        """How much better (+) or worse (-) the pairing goes than both heroes' strength predicts."""
+        return self.win_rate - (self.expected if self.expected is not None else 0.5)
+
+
+def overall_win_rate(counter_stats: list[dict], hero_id: int) -> float | None:
+    """A hero's win rate across all enemies, from the same matchup table."""
+    wins = matches = 0
     for row in counter_stats:
-        if int(row.get("hero_id", -1)) == hero_id and int(row.get("enemy_hero_id", -1)) in enemy_ids:
+        if int(row.get("hero_id", -1)) == hero_id:
+            wins += int(row.get("wins", 0))
+            matches += _matches(row)
+    return wins / matches if matches else None
+
+
+def expected_win_rate(mine: float, enemy: float) -> float:
+    """Win rate if the pairing itself didn't matter, combining both heroes' overall
+    strength on the log-odds scale. Without this a weak hero looks 'tough' against
+    everyone and every hero looks 'tough' against the strongest hero of the patch."""
+    def logit(p: float) -> float:
+        p = min(max(p, 1e-6), 1 - 1e-6)
+        return math.log(p / (1 - p))
+    return 1 / (1 + math.exp(-(logit(mine) - logit(enemy))))
+
+
+def matchups(counter_stats: list[dict], hero_id: int, enemy_ids: list[int],
+             names: dict[int, str] | None = None) -> list[Matchup]:
+    """My matchup against each enemy, worst edge first."""
+    names = names or {}
+    mine = overall_win_rate(counter_stats, hero_id)
+    out: list[Matchup] = []
+    for row in counter_stats:
+        eid = int(row.get("enemy_hero_id", -1))
+        if int(row.get("hero_id", -1)) == hero_id and eid in enemy_ids:
             m = _matches(row)
-            out[int(row["enemy_hero_id"])] = (smoothed_win_rate(int(row.get("wins", 0)), m), m)
-    return out
+            theirs = overall_win_rate(counter_stats, eid)
+            expected = expected_win_rate(mine, theirs) if mine is not None and theirs is not None else None
+            prior = expected if expected is not None else 0.5
+            out.append(Matchup(names.get(eid, str(eid)), smoothed_win_rate(int(row.get("wins", 0)), m, prior),
+                               m, expected, theirs))
+    return sorted(out, key=lambda mu: mu.edge)
 
 
-def playstyle_notes(hero: dict, core: dict[int, list[ItemPick]],
-                    hero_matchups: list[tuple[str, float, int]]) -> list[str]:
+def playstyle_notes(hero: dict, core: dict[int, list[ItemPick]], hero_matchups: list[Matchup],
+                    my_overall: float | None = None) -> list[str]:
     notes: list[str] = []
     desc = hero.get("description") or {}
     if isinstance(desc, dict):
@@ -252,20 +312,37 @@ def playstyle_notes(hero: dict, core: dict[int, list[ItemPick]],
                        "vitality": "survivability"}.get(main, main)
             notes.append(f"Winning builds lean on {flavour}: {share:.0%} of the top items are {main} items.")
 
+    if my_overall is not None and my_overall >= STRONG_ENEMY_WR:
+        notes.append(f"Your hero is strong right now ({my_overall:.0%} win rate against everyone). "
+                     f"Play to that and take fights.")
+    elif my_overall is not None and my_overall <= 1 - STRONG_ENEMY_WR:
+        notes.append(f"Your hero is struggling right now ({my_overall:.0%} win rate against everyone). "
+                     f"Lean on the build below and play with your team.")
+
     if hero_matchups:
-        best = max(hero_matchups, key=lambda m: m[1])
-        worst = min(hero_matchups, key=lambda m: m[1])
-        if best[1] >= 0.52:
-            notes.append(f"You do well against {best[0]} ({best[1]:.0%} win rate). Look to fight them.")
-        if worst[1] <= 0.48:
-            notes.append(f"{worst[0]} is a tough matchup ({worst[1]:.0%} win rate). Avoid fighting them alone.")
+        best = max(hero_matchups, key=lambda m: m.edge)
+        worst = min(hero_matchups, key=lambda m: m.edge)
+        if best.edge >= MATCHUP_EDGE:
+            notes.append(f"{best.enemy} is your best matchup ({best.edge * 100:+.0f} points better than "
+                         f"expected). Look to fight them.")
+        if worst.edge <= -MATCHUP_EDGE:
+            notes.append(f"{worst.enemy} is a tough matchup ({worst.edge * 100:+.0f} points worse than "
+                         f"expected). Avoid fighting them alone.")
+        strongest = max(hero_matchups, key=lambda m: m.enemy_overall or 0)
+        if (strongest.enemy_overall or 0) >= STRONG_ENEMY_WR:
+            notes.append(f"{strongest.enemy} is strong right now ({strongest.enemy_overall:.0%} win rate "
+                         f"against everyone). Track them and don't take even fights.")
     return notes
 
 
-def _strip_tags(text: str) -> str:
+def _strip_tags(text: str, line_break: str = " ") -> str:
+    """Remove the API's HTML markup. `line_break` replaces <br> so separate
+    effects in an upgrade ("+1s Sleep Duration<br>Applies 15 stacks") stay readable."""
     import re
-    text = re.sub(r"<br\s*/?>", " ", text)
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", text)).strip()
+    text = re.sub(r"\s*<br\s*/?>\s*", "\x00", text)
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", text)).strip()
+    text = re.sub(r"\s*/\s*per\b", " per", text)  # "+0.11/ per Stack" -> "+0.11 per Stack"
+    return line_break.join(part.strip() for part in text.split("\x00") if part.strip())
 
 
 # ---------- wiring ----------
@@ -294,9 +371,10 @@ def recommend(api, hero_name: str, enemy_names: list[str], min_average_badge: in
     if enemy_ids:
         vs_stats = api.item_stats(int(hero["id"]), enemy_hero_ids=enemy_ids, min_average_badge=min_average_badge)
         rec.counter_items = counter_items(base_stats, vs_stats, item_index)
-        mu = matchups(api.hero_counter_stats(min_average_badge), int(hero["id"]), enemy_ids)
-        names = {int(e["id"]): e["name"] for e in enemies}
-        rec.matchups = sorted(((names[i], wr, m) for i, (wr, m) in mu.items()), key=lambda x: x[1])
+        counter_stats = api.hero_counter_stats(min_average_badge)
+        rec.overall_win_rate = overall_win_rate(counter_stats, int(hero["id"]))
+        rec.matchups = matchups(counter_stats, int(hero["id"]), enemy_ids,
+                                {int(e["id"]): e["name"] for e in enemies})
 
     order = best_ability_order(api.ability_order_stats(int(hero["id"]), min_average_badge))
     if order:
@@ -307,5 +385,5 @@ def recommend(api, hero_name: str, enemy_names: list[str], min_average_badge: in
         rec.ability_order_matches = _matches(order)
         rec.ability_order_win_rate = raw_win_rate(order)
 
-    rec.playstyle = playstyle_notes(hero, rec.core_items, rec.matchups)
+    rec.playstyle = playstyle_notes(hero, rec.core_items, rec.matchups, rec.overall_win_rate)
     return rec
