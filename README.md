@@ -26,5 +26,9 @@ python -m deadlock_helper Haze --enemies "Lash, Seven, Abrams, Bebop, Wraith, Pa
 
 `--min-badge N` limits the stats to higher-rank games.
 
+`python scripts/simulate.py --matches 3 --seed 2026 --out sim_output` draws random 6v6 lobbies
+and runs the helper for all 12 heroes in each, which is a quick way to spot-check advice across
+many heroes.
+
 `python scripts/inspect_api.py` prints a sample from every API endpoint used, which helps
 when the API changes. `python -m unittest` runs the logic tests.

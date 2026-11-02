@@ -18,9 +18,17 @@ class ItemTests(unittest.TestCase):
         stats = [
             {"item_id": 1, "wins": 3000, "matches": 5600},  # 53.6% over many games
             {"item_id": 3, "wins": 35, "matches": 55},      # 64% but few games
+            {"item_id": 2, "wins": 2500, "matches": 5000},  # rest of the tier, so the tier average is realistic
         ]
         ranked = r.rank_items(stats, ITEMS)[1]
         self.assertEqual(ranked[0].name, "Basic Mag")
+
+    def test_weak_hero_thin_items_do_not_jump_the_queue(self):
+        # Hero wins ~45%. A 200-game item at 46% should not beat a 100k-game item at 47%.
+        stats = [{"item_id": 1, "wins": 47000, "matches": 100000},
+                 {"item_id": 3, "wins": 92, "matches": 200},
+                 {"item_id": 2, "wins": 43000, "matches": 100000}]
+        self.assertEqual(r.rank_items(stats, ITEMS)[1][0].name, "Basic Mag")
 
     def test_abilities_and_low_sample_items_excluded(self):
         stats = [{"item_id": 100, "wins": 900, "matches": 1000}, {"item_id": 2, "wins": 5, "matches": 10}]
@@ -77,10 +85,34 @@ class PlaystyleTests(unittest.TestCase):
     def test_notes(self):
         core = {1: [r.ItemPick(2, "Extra Spirit", 1, "spirit", 800, 0.55, 500)]}
         notes = r.playstyle_notes({"description": {"role": "<b>Burst</b> caster"}}, core,
-                                  [("Lash", 0.56, 300), ("Seven", 0.44, 300)])
+                                  [r.Matchup("Lash", 0.56, 300, 0.50, 0.50), r.Matchup("Seven", 0.44, 300, 0.50, 0.50)])
         self.assertIn("Burst caster", notes)
         self.assertTrue(any("spirit" in n for n in notes))
         self.assertTrue(any("Seven is a tough matchup" in n for n in notes))
+
+    def test_matchups_account_for_both_heroes_strength(self):
+        # Hero 1 is weak (40%), hero 3 is strong (60%). 1 vs 3 at 34% is about what both
+        # strengths predict (~31%), so it is not a bad matchup; 1 vs 2 at 44% is a good one.
+        stats = [{"hero_id": 1, "enemy_hero_id": 2, "wins": 460, "matches": 1000},
+                 {"hero_id": 1, "enemy_hero_id": 3, "wins": 340, "matches": 1000},
+                 {"hero_id": 2, "enemy_hero_id": 1, "wins": 540, "matches": 1000},
+                 {"hero_id": 2, "enemy_hero_id": 3, "wins": 440, "matches": 1000},
+                 {"hero_id": 3, "enemy_hero_id": 1, "wins": 660, "matches": 1000},
+                 {"hero_id": 3, "enemy_hero_id": 2, "wins": 560, "matches": 1000}]
+        self.assertAlmostEqual(r.overall_win_rate(stats, 1), 0.40)
+        self.assertAlmostEqual(r.expected_win_rate(0.5, 0.5), 0.5)
+        mus = {m.enemy: m for m in r.matchups(stats, 1, [2, 3], {2: "Lash", 3: "Seven"})}
+        self.assertGreater(mus["Lash"].edge, 0.02)
+        self.assertGreater(mus["Seven"].edge, -0.02)  # raw 34% looks awful, but it's expected
+        notes = r.playstyle_notes({}, {}, list(mus.values()))
+        self.assertTrue(any(n.startswith("Lash is your best matchup") for n in notes))
+        self.assertTrue(any(n.startswith("Seven is strong right now") for n in notes))
+        self.assertIsNone(r.overall_win_rate(stats, 99))
+
+    def test_upgrade_text_keeps_line_breaks_readable(self):
+        self.assertEqual(r._strip_tags('<b>+1s</b> Sleep<br>Applies <i>15</i> stacks', line_break="; "),
+                         "+1s Sleep; Applies 15 stacks")
+        self.assertEqual(r._strip_tags("+0.11</span>/ per Stack"), "+0.11 per Stack")
 
     def test_find_hero_partial(self):
         heroes = [{"id": 1, "name": "Mo & Krill"}, {"id": 2, "name": "Haze"}]
