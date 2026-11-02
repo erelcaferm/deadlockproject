@@ -1,6 +1,7 @@
-"""Command line entry point.
+"""Entry point. With no arguments it opens the desktop app; with a hero it prints advice.
 
-Example:
+Examples:
+    python -m deadlock_helper
     python -m deadlock_helper Haze --enemies "Lash, Seven, Abrams, Mo & Krill, Bebop, Wraith"
 """
 
@@ -89,11 +90,15 @@ def format_recommendation(rec: Recommendation) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deadlock build and playstyle suggestions")
-    parser.add_argument("hero", help="your hero, e.g. Haze")
+    parser.add_argument("hero", nargs="?", help="your hero, e.g. Haze (leave out to open the app)")
     parser.add_argument("--enemies", default="", help="comma separated enemy heroes")
     parser.add_argument("--min-badge", type=int, default=None,
                         help="only use games at or above this average badge (rank) level")
     args = parser.parse_args()
+    if not args.hero:
+        from .gui import main as gui_main
+        gui_main()
+        return
     enemies = [e.strip() for e in args.enemies.split(",") if e.strip()]
     print(format_recommendation(recommend(DeadlockAPI(), args.hero, enemies, args.min_badge)))
 
