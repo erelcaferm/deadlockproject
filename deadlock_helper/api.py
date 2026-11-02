@@ -92,3 +92,27 @@ class DeadlockAPI:
         params = {"min_unix_timestamp": self._since(), "min_average_badge": min_average_badge,
                   "same_lane_filter": "false"}
         return self._get(ANALYTICS_URL, "/v1/analytics/hero-counter-stats", params, ANALYTICS_TTL_S)
+
+    # ---------- player data (used only by the ranked guard) ----------
+    def active_matches(self, account_id: int) -> list[dict]:
+        """Live matches this player is in. The API only sees the ~200 matches on the
+        in-game Watch tab, so an empty result does not prove the player is idle."""
+        return self._get(ANALYTICS_URL, "/v1/matches/active", {"account_id": account_id}, 30)
+
+    def match_history(self, account_id: int) -> list[dict]:
+        return self._get(ANALYTICS_URL, f"/v1/players/{account_id}/match-history", None, 600)
+
+    # ---------- images ----------
+    def image_bytes(self, url: str) -> bytes:
+        """Download a hero portrait or icon, cached on disk for a week."""
+        key = hashlib.sha1(url.encode()).hexdigest()
+        suffix = Path(url.split("?")[0]).suffix or ".img"
+        cache_file = self.cache_dir / "images" / f"{key}{suffix}" if self.cache_dir else None
+        if cache_file and cache_file.exists() and time.time() - cache_file.stat().st_mtime < 7 * 24 * 3600:
+            return cache_file.read_bytes()
+        resp = self.session.get(url, timeout=self.timeout)
+        resp.raise_for_status()
+        if cache_file:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_bytes(resp.content)
+        return resp.content
